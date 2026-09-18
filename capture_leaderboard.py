@@ -8,6 +8,16 @@ to captures.csv. Nothing is extracted from the page: the wallet-anchor count
 and the "No data yet" check below are a validity gate, not parsing, and
 row_count stays blank on every row (step 2 fills it).
 
+The manifest is the only thing here that cannot be regenerated, so it is
+defended harder than anything else in the file:
+
+  * The tail of captures.csv is checked BEFORE every append. A file that does
+    not end in a newline, or whose last row is short or unhashed, fails the
+    run with exit 1 and NO append at all -- see check_manifest_tail().
+  * A blank schema_version means the v2 columns are EMPTY. It is never a
+    licence to carry unhashed evidence -- see manifest_row_problems().
+  * The header may be widened, never narrowed -- see migrate_manifest().
+
 Not an analysis tool. Not a trading tool. Never calls git. Writes only inside
 this directory.
 """
@@ -83,6 +93,13 @@ MANIFEST_COLUMNS = (MANIFEST_COLUMNS_V1[:_CUT] + V2_ADDED_COLUMNS
 
 SCHEMA_COLUMNS = {"": MANIFEST_COLUMNS_V1, "2": MANIFEST_COLUMNS}
 
+# The v2 columns that carry EVIDENCE. `schema_version` itself is the
+# declaration, not evidence, so it is excluded. A row that declares itself v1
+# (blank schema_version) must leave every column in this list empty; the v1
+# hash does not cover them, so anything sitting here on such a row is data
+# nobody signed. See manifest_row_problems().
+V2_EVIDENCE_COLUMNS = [c for c in V2_ADDED_COLUMNS if c != "schema_version"]
+
 # Which query-string keys on the observed source_url feed which manifest
 # column. Matched case-insensitively, first hit wins; blank if absent.
 # Values are recorded as observed -- never hardcoded -- so that a silent
@@ -99,6 +116,96 @@ PLATFORM_KEY_CANDIDATES = ("platform", "platforms", "source")
 log = logging.getLogger("capture")
 
 
+class ManifestIntegrityError(RuntimeError):
+    """The manifest on disk, or a row about to be written, is not appendable.
+
+    Always fatal, never a warning. When this is raised nothing has been
+    written to captures.csv and nothing will be: the run logs the specific
+    problem and exits 1. Raw artifacts already on disk stay exactly where they
+    are -- they are the evidence that a capture happened, and they are
+    re-parseable later once the manifest is repaired by hand.
+    """
+
+
+# ------------------------------------------------------- row-level validity --
+def row_label(row, line_num=None):
+    """A specific, human-findable name for one manifest row.
+
+    Every integrity message routes through this, because "a row is invalid" is
+    useless and "line 37 (capture_id=fomo-30d-...)" is actionable.
+    """
+    bits = []
+    if line_num is not None:
+        bits.append("line %d" % line_num)
+    capture_id = str(row.get("capture_id") or "").strip()
+    if capture_id:
+        bits.append("capture_id=%s" % capture_id)
+    if not bits:
+        return "manifest row"
+    return "manifest row (%s)" % ", ".join(bits)
+
+
+def unknown_schema_message(row, version, line_num=None):
+    """Why an unrecognised schema_version is fatal FOR THAT ROW, by name."""
+    known = ", ".join(repr(v) for v in sorted(SCHEMA_COLUMNS))
+    return ("%s declares schema_version %r, which this script has no column "
+            "list for (known versions: %s). Without a column list its row_hash "
+            "can neither be computed nor checked, so the chain cannot be "
+            "verified across it. Either this file was written by a newer "
+            "capture_leaderboard.py, or the cell was edited."
+            % (row_label(row, line_num), version, known))
+
+
+def manifest_row_problems(row, line_num=None):
+    """Every rule this one manifest row breaks, named. NEVER raises.
+
+    Returns a list of human-readable strings; empty means the row is valid.
+    Three callers: append_manifest_row() before writing a row,
+    check_manifest_tail() before chaining from the last row on disk, and
+    (step 4) `verify`, which walks every row and REPORTS each problem rather
+    than dying on the first one.
+
+    The rules:
+
+    1. `schema_version` must be a version this script knows -- a key of
+       SCHEMA_COLUMNS. See unknown_schema_message() for why an unknown one is
+       not "probably fine".
+
+    2. A BLANK `schema_version` means ONE thing, and only one: this is a
+       schema-v1 row, and its v2 columns (V2_EVIDENCE_COLUMNS) are EMPTY.
+       It is NOT a declaration that v2 columns may be ignored. The v1 hash
+       does not cover those columns, so a blank-version row carrying a
+       non-empty raw_json_path or raw_json_sha256 would be evidence that no
+       hash signs -- and a row shaped exactly like that is how a forged
+       capture would walk in through the front door and still verify clean.
+       Such a row is invalid: either it is v2 and must say so, or the columns
+       must be empty.
+
+    The four rows this file was born with have those columns empty, so they
+    remain valid v1 rows under this tightened reading and their stored
+    row_hash values are untouched by it.
+    """
+    version = row.get("schema_version") or ""
+    if version not in SCHEMA_COLUMNS:
+        return [unknown_schema_message(row, version, line_num)]
+
+    problems = []
+    if version == "":
+        label = row_label(row, line_num)
+        for name in V2_EVIDENCE_COLUMNS:
+            value = str(row.get(name) or "")
+            if value.strip():
+                problems.append(
+                    "%s leaves schema_version blank -- which declares it a v1 "
+                    "row whose hash does NOT cover %s -- yet carries %s=%r. "
+                    "That is unhashed evidence. A v1 row must have every v2 "
+                    "column (%s) empty; a row with data in them must declare "
+                    "schema_version=%r."
+                    % (label, name, name, value,
+                       ", ".join(V2_EVIDENCE_COLUMNS), SCHEMA_VERSION))
+    return problems
+
+
 # -------------------------------------------------------------- hash chain --
 def row_hash(row, schema_version=None):
     """Canonical row serialisation, so `verify` (step 4) can reproduce it.
@@ -111,11 +218,20 @@ def row_hash(row, schema_version=None):
            v1 ("")  -> MANIFEST_COLUMNS_V1  (20 names, ending prev_hash,
                        row_hash) -- the layout the file was born with. Columns
                        added to the CSV after v1 are NOT part of a v1 row's
-                       hash and are ignored entirely when hashing it, whatever
-                       they contain.
+                       hash. Because they are not hashed, a v1 row is only
+                       valid when they are EMPTY: blank schema_version means
+                       "the v2 columns are empty", never "ignore whatever is
+                       in them" (manifest_row_problems(), rule 2).
            v2 ("2") -> MANIFEST_COLUMNS     (23 names; schema_version,
                        raw_json_path, raw_json_sha256 inserted between `error`
                        and `prev_hash`).
+         A version that is neither -- anything not a key of SCHEMA_COLUMNS --
+         is UNKNOWN. There is no column list for it, so there is no defined
+         hash for that row: this function raises ManifestIntegrityError naming
+         the row and the version, and `verify` must report that row as
+         unverifiable and carry on with the rest. It must never be treated as
+         v1 by default, and it must never take down a whole pass with a bare
+         KeyError.
       3. Hash over every column in that list EXCEPT `row_hash` itself, in list
          order, prev_hash INCLUDED. A column named in the list but absent from
          the row is the empty string.
@@ -131,6 +247,9 @@ def row_hash(row, schema_version=None):
     """
     if schema_version is None:
         schema_version = (row.get("schema_version") or "")
+    if schema_version not in SCHEMA_COLUMNS:
+        raise ManifestIntegrityError(
+            unknown_schema_message(row, schema_version))
     columns = SCHEMA_COLUMNS[schema_version]
     parts = []
     for name in columns:
@@ -174,11 +293,112 @@ def manifest_lock():
             fh.close()
 
 
+def check_manifest_tail():
+    """Refuse to append to a manifest whose tail is not intact.
+
+    Holds no lock of its own: the caller MUST already hold manifest_lock(),
+    and must call this BEFORE migrate_manifest(), because migrating rewrites
+    the whole file and would silently paper over -- or worse, consume -- the
+    damage this function exists to find.
+
+    Two failure modes, both fatal, neither a warning:
+
+    1. NO TRAILING NEWLINE. A csv writer opened in append mode starts exactly
+       where the file ends. If the final byte is not "\\n", the next row welds
+       onto the previous line. csv.DictReader then hands the surplus fields to
+       `restkey` and the welded row ceases to exist AS A ROW: the capture
+       writes its HTML and its JSON, logs nothing wrong, and exits 0 with no
+       manifest row. Silent, total, and invisible from the exit code -- the
+       single worst thing this script could do.
+
+    2. A SHORT OR UNHASHED FINAL ROW. A process killed mid-append leaves a
+       truncated last record. read_prev_hash() would then return None or "",
+       the next row would hash over the string "None" while writing "" into
+       the prev_hash cell, and that row would be permanently unverifiable.
+       So: the last row must have exactly as many fields as the header, and a
+       non-empty row_hash. It must also pass manifest_row_problems(), since it
+       is the row the next row's hash is chained to.
+
+    THE DELIBERATE DECISION: on any of these, append NOTHING -- not even a
+    FAIL row. Writing a FAIL row into a manifest whose tail is already
+    malformed appends to the corruption just detected, and very possibly welds
+    that FAIL row onto the broken line, destroying the evidence of what
+    happened. An intact chain plus a loud log is worth more than a row. The
+    run logs exactly what is wrong and on which line, exits 1, and leaves the
+    raw artifacts on disk as proof the capture itself ran.
+    """
+    if not MANIFEST_PATH.exists():
+        return                      # a fresh file gets a header, not a weld
+    data = MANIFEST_PATH.read_bytes()
+    if not data:
+        return                      # ditto: zero bytes, nothing to weld onto
+
+    if not data.endswith(b"\n"):
+        line_num = data.count(b"\n") + 1
+        tail = data.rsplit(b"\n", 1)[-1][-160:].decode("utf-8", "replace")
+        raise ManifestIntegrityError(
+            "%s line %d does not end in a newline. Appending now would weld "
+            "the next row onto that line; csv.DictReader would dump the "
+            "surplus into `restkey` and the welded row would vanish from the "
+            "manifest entirely. Nothing was appended. Unterminated tail: %r"
+            % (MANIFEST_PATH.name, line_num, tail))
+
+    with MANIFEST_PATH.open("r", newline="", encoding="utf-8") as fh:
+        reader = csv.reader(fh)
+        header = next(reader, None)
+        last, last_line = None, None
+        for record in reader:
+            if not record:
+                continue            # a wholly blank line carries no row
+            last, last_line = record, reader.line_num
+
+    if header is None:
+        raise ManifestIntegrityError(
+            "%s has bytes but no header row; refusing to append to a file "
+            "whose columns are unknown. Nothing was appended."
+            % MANIFEST_PATH.name)
+    if "row_hash" not in header:
+        raise ManifestIntegrityError(
+            "%s header has no row_hash column (header: %s); the chain cannot "
+            "be extended. Nothing was appended."
+            % (MANIFEST_PATH.name, ", ".join(header)))
+    if last is None:
+        return                      # header only: the chain starts at genesis
+
+    if len(last) != len(header):
+        raise ManifestIntegrityError(
+            "%s line %d has %d field(s) but the header declares %d -- the "
+            "last row is truncated or run together, most likely a capture "
+            "killed mid-append. Chaining from it would produce a permanently "
+            "unverifiable row. Nothing was appended. First cell: %r"
+            % (MANIFEST_PATH.name, last_line, len(last), len(header),
+               last[0] if last else ""))
+
+    tail_row = dict(zip(header, last))
+    if not str(tail_row.get("row_hash") or "").strip():
+        raise ManifestIntegrityError(
+            "%s has an empty row_hash on its last row (%s). A row that was "
+            "never hashed cannot be chained from: the next row would record "
+            "prev_hash=\"\" and nothing would ever prove the two belong "
+            "together. Nothing was appended."
+            % (MANIFEST_PATH.name, row_label(tail_row, last_line)))
+
+    problems = manifest_row_problems(tail_row, last_line)
+    if problems:
+        raise ManifestIntegrityError(
+            "%s cannot be chained from: %s Nothing was appended."
+            % (MANIFEST_PATH.name, " ".join(problems)))
+
+
 def read_prev_hash():
     """row_hash of the last manifest row, or the genesis constant.
 
     Callers MUST hold manifest_lock() across this and the matching append,
-    otherwise two overlapping runs read the same prev_hash and fork the chain.
+    otherwise two overlapping runs read the same prev_hash and fork the chain,
+    and MUST have called check_manifest_tail() first. The blank check below is
+    belt-and-braces: check_manifest_tail() has already made it unreachable,
+    and it stays because the alternative -- hashing the string "None" -- is
+    silent and permanent.
     """
     if not MANIFEST_PATH.exists():
         return GENESIS_PREV_HASH
@@ -188,11 +408,27 @@ def read_prev_hash():
             last = row
     if last is None:
         return GENESIS_PREV_HASH
-    return last["row_hash"]
+    prev = str(last.get("row_hash") or "").strip()
+    if not prev:
+        raise ManifestIntegrityError(
+            "last row of %s has no row_hash to chain from (%s)"
+            % (MANIFEST_PATH.name, row_label(last)))
+    return prev
 
 
 def append_manifest_row(row):
-    is_new = not MANIFEST_PATH.exists()
+    """Append one row. Caller holds the lock and has run check_manifest_tail().
+
+    The row is validated before it is written, so the schema rules in
+    manifest_row_problems() guard the way IN as well as the way out: no path
+    through this script can put a row on disk that `verify` would then have to
+    flag.
+    """
+    problems = manifest_row_problems(row)
+    if problems:
+        raise ManifestIntegrityError(
+            "refusing to append an invalid manifest row: %s" % " ".join(problems))
+    is_new = not MANIFEST_PATH.exists() or MANIFEST_PATH.stat().st_size == 0
     with MANIFEST_PATH.open("a", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=MANIFEST_COLUMNS,
                                 lineterminator="\n")
@@ -204,19 +440,52 @@ def append_manifest_row(row):
 
 
 def migrate_manifest():
-    """Widen an older header to MANIFEST_COLUMNS. Caller holds the lock.
+    """Widen an older header to MANIFEST_COLUMNS. NEVER narrow one.
+
+    Caller holds the lock, and has already run check_manifest_tail().
 
     Existing field VALUES are never touched -- new columns are added empty --
     and empty schema_version keeps those rows on the v1 hash rule, so their
     stored row_hash values still reproduce byte for byte.
+
+    ADD-ONLY, deliberately. Rewriting the header to exactly MANIFEST_COLUMNS
+    whenever it differs means an OLDER checkout of this script silently
+    DELETES columns a newer one added, taking the data in them with it -- and
+    the deletion is invisible, because the rows it rewrites still hash fine
+    under their own schema version. So a header carrying a column this script
+    does not know is a fatal error that changes NOTHING on disk. The fix is to
+    run the newer script, not to drop the column.
     """
-    if not MANIFEST_PATH.exists():
+    if not MANIFEST_PATH.exists() or MANIFEST_PATH.stat().st_size == 0:
         return
     with MANIFEST_PATH.open("r", newline="", encoding="utf-8") as fh:
         reader = csv.DictReader(fh)
-        if reader.fieldnames == MANIFEST_COLUMNS:
+        existing = reader.fieldnames
+        if existing is None:
             return
+
+        if len(set(existing)) != len(existing):
+            dupes = sorted({c for c in existing if existing.count(c) > 1})
+            raise ManifestIntegrityError(
+                "%s header repeats column(s): %s. A duplicated column name "
+                "makes every row ambiguous. Nothing was changed."
+                % (MANIFEST_PATH.name, ", ".join(dupes)))
+
+        unknown = [c for c in existing if c not in MANIFEST_COLUMNS]
+        if unknown:
+            raise ManifestIntegrityError(
+                "%s header carries %d column(s) this script does not know: "
+                "%s. Rewriting the header to this script's layout would "
+                "DELETE them and every value in them -- almost certainly the "
+                "work of a newer capture_leaderboard.py. Nothing was changed; "
+                "run the newer script instead."
+                % (MANIFEST_PATH.name, len(unknown), ", ".join(unknown)))
+
+        if existing == MANIFEST_COLUMNS:
+            return                  # already current: idempotent, no rewrite
         rows = list(reader)
+
+    added = [c for c in MANIFEST_COLUMNS if c not in existing]
     tmp = MANIFEST_PATH.with_suffix(".csv.tmp")
     with tmp.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=MANIFEST_COLUMNS,
@@ -226,12 +495,18 @@ def migrate_manifest():
             writer.writerow({k: row.get(k, "") or "" for k in MANIFEST_COLUMNS})
         fh.flush()
         os.fsync(fh.fileno())
-    tmp.replace(MANIFEST_PATH)
-    log.info("manifest header widened to schema v%s (%d existing rows padded)",
-             SCHEMA_VERSION, len(rows))
+    tmp.replace(MANIFEST_PATH)      # atomic: readers see old or new, never half
+    log.info("manifest header widened to schema v%s: added %s "
+             "(%d existing rows padded, no column dropped)",
+             SCHEMA_VERSION, ", ".join(added) or "(reordered only)", len(rows))
 
 
 # ----------------------------------------------------------------- helpers --
+def iso_z(moment):
+    """The one timestamp format written to the manifest. UTC, second-resolution."""
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def sha256_file(path):
     digest = hashlib.sha256()
     with path.open("rb") as fh:
@@ -287,6 +562,9 @@ def fetch_page(observed):
     {"url": str, "body": bytes|None, "body_error": str}. The body is read
     inside the handler because the response is gone by the time the page
     closes.
+
+    The returned "captured_at" is THE capture timestamp: see the comment at
+    the stamp site below. It is deliberately produced here, not by the caller.
     """
     from playwright.sync_api import sync_playwright
 
@@ -335,7 +613,19 @@ def fetch_page(observed):
                 nav_error = "%s: %s" % (type(exc).__name__, exc)
                 log.warning("board did not become ready: %s", nav_error)
             page.wait_for_timeout(API_SETTLE_MS)
+
+            # THE CAPTURE TIMESTAMP. The board is now either confirmed
+            # rendered or provably not, and the next statement harvests its
+            # content: this instant is when the site was actually observed.
+            # Stamping it before the browser ran (as this did) made it 5-10s
+            # early -- immaterial at 30D, but the 1D board is a rolling 24h
+            # window, so at 1D this number IS the measurement: the analysis
+            # discards pairs whose windows overlap too much and can only do
+            # that from an honest timestamp. capture_id embeds this same
+            # instant (see capture()), so the id and the column never disagree.
+            captured_at = datetime.now(timezone.utc)
             html = page.content()
+
             try:
                 anchors = len(page.query_selector_all(BOARD_READY_SELECTOR))
             except Exception:                         # noqa: BLE001
@@ -346,7 +636,7 @@ def fetch_page(observed):
                 text = html
             return {"html": html, "method": method, "anchors": anchors,
                     "empty_text": EMPTY_BOARD_TEXT in text,
-                    "nav_error": nav_error}
+                    "nav_error": nav_error, "captured_at": captured_at}
         finally:
             browser.close()
 
@@ -401,17 +691,29 @@ def failure_reasons(observed, chosen, anchors, empty_text, nav_error):
 
 
 def capture():
-    now = datetime.now(timezone.utc)
-    capture_date = now.strftime("%Y-%m-%d")
-    capture_id = "%s-%dd-%s-%s" % (PLATFORM, TIMEFRAME_DAYS,
-                                   now.strftime("%Y%m%dT%H%M%SZ"),
-                                   uuid.uuid4().hex[:8])
-    log.info("capture_id=%s", capture_id)
+    started_at = datetime.now(timezone.utc)
+    log.info("capture run started at %s", iso_z(started_at))
 
     observed = []
     page_info = fetch_page(observed)
 
-    # Raw bytes land first, before anything is evaluated: a failed capture
+    # captured_at_utc comes from INSIDE fetch_page -- the moment the rendered
+    # board was harvested -- not from before the browser launched. capture_id
+    # is minted from that same instant, here and nowhere else, because the id
+    # names the raw files and the raw files must be written before any gate
+    # condition is evaluated (a failed capture still leaves its evidence).
+    # So: harvest -> stamp -> mint id -> write raw -> evaluate -> append row.
+    now = page_info["captured_at"]
+    captured_at_utc = iso_z(now)
+    capture_date = now.strftime("%Y-%m-%d")
+    capture_id = "%s-%dd-%s-%s" % (PLATFORM, TIMEFRAME_DAYS,
+                                   now.strftime("%Y%m%dT%H%M%SZ"),
+                                   uuid.uuid4().hex[:8])
+    log.info("capture_id=%s captured_at_utc=%s (%.1fs after run start; the "
+             "browser work is inside that gap, not after it)",
+             capture_id, captured_at_utc, (now - started_at).total_seconds())
+
+    # Raw bytes land next, before anything is evaluated: a failed capture
     # must still leave its evidence on disk.
     day_dir = RAW_DIR / capture_date
     day_dir.mkdir(parents=True, exist_ok=True)
@@ -449,7 +751,7 @@ def capture():
 
     row = {
         "capture_id": capture_id,
-        "captured_at_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "captured_at_utc": captured_at_utc,
         "capture_date_utc": capture_date,
         "platform": PLATFORM,
         "timeframe_days": str(TIMEFRAME_DAYS),
@@ -470,7 +772,12 @@ def capture():
 
     # read-prev-hash and append are ONE critical section: a launchd
     # kickstart-on-wake landing on a manual run must queue, not fork.
+    # Order inside it matters. check_manifest_tail() runs FIRST, before
+    # migrate_manifest(), because migrating rewrites the whole file: run the
+    # other way round it would quietly repair -- or swallow -- exactly the
+    # damage the tail check exists to refuse to append onto.
     with manifest_lock():
+        check_manifest_tail()
         migrate_manifest()
         row["prev_hash"] = read_prev_hash()
         row["row_hash"] = row_hash(row)
@@ -489,6 +796,17 @@ def main():
     setup_logging()
     try:
         row = capture()
+    except ManifestIntegrityError as exc:
+        # Loud on purpose, and specific: the message names the file, the line
+        # and what is wrong with it. Nothing was appended -- see
+        # check_manifest_tail() for why appending a FAIL row here would make
+        # things worse, not better.
+        log.error("MANIFEST INTEGRITY FAILURE: %s", exc)
+        log.error("captures.csv was NOT modified and NO row was appended. "
+                  "Any raw artifacts this run wrote are still on disk as "
+                  "evidence. Take a copy of captures.csv, repair the named "
+                  "line by hand, then capture again.")
+        return 1
     except Exception as exc:                          # noqa: BLE001
         log.error("capture failed: %s: %s", type(exc).__name__, exc)
         return 1
