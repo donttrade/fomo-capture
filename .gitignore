@@ -1,5 +1,22 @@
 .venv/
 __pycache__/
 *.pyc
-logs/
+
+# logs/ itself is TRACKED, its contents are not -- and the distinction is
+# load-bearing, not tidiness. launchd opens StandardOutPath BEFORE it runs
+# ProgramArguments, so on a fresh clone with no logs/ directory the job fails
+# to spawn at all and run_capture.sh's own `mkdir -p` never gets the chance to
+# run. logs/.gitkeep is what puts the directory in the clone.
+#
+# It has to be written `logs/*`, not `logs/`. Git does not descend into an
+# ignored DIRECTORY, so with `logs/` the negation below is never even
+# considered and .gitkeep stays invisible. Ignoring the CONTENTS instead
+# leaves the directory itself visible for the negation to rescue one file
+# from. Checked with `git check-ignore -v`.
+logs/*
+!logs/.gitkeep
+
+# Both lock files: advisory locks, one per machine, meaningless to anyone
+# else. See manifest_lock() and run_lock() in capture_leaderboard.py.
 .captures.lock
+.capture_run.lock

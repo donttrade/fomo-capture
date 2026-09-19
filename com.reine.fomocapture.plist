@@ -1,0 +1,169 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.reine.fomocapture  |  BUILD STEP 6, PLAN.md decision 6.
+
+  Runs the FOMO leaderboard capture once a day. This file lives in fomo/ and is
+  SYMLINKED into ~/Library/LaunchAgents/, so the scheduling is version
+  controlled alongside the thing it schedules.
+
+  It launches run_capture.sh and nothing else. Every path here is absolute,
+  because a launch agent inherits no shell startup file and no useful PATH.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.reine.fomocapture</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/reinestarr/Trading with Claude Code/fomo/run_capture.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key><string>/Users/reinestarr/Trading with Claude Code/fomo</string>
+
+  <!--
+    TWO LOG FILES, and pointing these two keys at the OTHER one is the fix for
+    a real defect. They used to name logs/capture.log, which is the file the
+    python's own logger writes -- and because that logger also echoes to
+    stdout, every line it wrote landed in that file TWICE. Twenty-two captures
+    produced forty-four "manifest row appended" lines, which is exactly the
+    kind of doubling that makes a person mistrust a count.
+
+    So they are split by who writes them:
+
+      logs/capture.log  -- the python's own logger, written directly by a
+                           FileHandler. One line per event, no duplication.
+                           This is the run's story: what was captured, what
+                           was skipped, what failed and why.
+      logs/launchd.log  -- everything launchd sees on the job's stdout and
+                           stderr. run_capture.sh's start/finish banners, a
+                           traceback from an import that died before logging
+                           was configured, Playwright's and Chrome's stderr
+                           chatter -- none of which the logger can reach.
+
+    THE HONEST CAVEAT: the python's logger still echoes to stdout as well as
+    to its file, so launchd.log also carries a copy of capture.log's lines. No
+    ONE file is doubled, which was the defect; but launchd.log is a superset,
+    not a tidy stderr-only file, and a reader should go to capture.log first.
+    The echo is kept because it is what a person sees when they run
+    ./run_capture.sh by hand in a terminal.
+
+    launchd APPENDS to both, so each accumulates fire after fire in order. If
+    the python never starts at all, the wrapper's two banner lines in
+    launchd.log are the only evidence the job fired -- that is the case this
+    redirect exists for, and capture.log would be silent.
+  -->
+  <key>StandardOutPath</key><string>/Users/reinestarr/Trading with Claude Code/fomo/logs/launchd.log</string>
+  <key>StandardErrorPath</key><string>/Users/reinestarr/Trading with Claude Code/fomo/logs/launchd.log</string>
+
+  <!--
+    07:30 local AND RunAtLoad, both, because macOS is not a server: it does
+    not run jobs while asleep and it does not catch up a fire it slept
+    through. StartCalendarInterval alone would silently miss every day the lid
+    was shut at 07:30. RunAtLoad covers login, wake and unlock.
+
+    Firing three ways is only safe because the capture is idempotent per UTC
+    date: anything already OK today is skipped, writes nothing and costs
+    nothing. See the IDEMPOTENCE block in capture_leaderboard.py.
+  -->
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Hour</key><integer>7</integer><key>Minute</key><integer>30</integer></dict>
+  </array>
+  <key>RunAtLoad</key><true/>
+
+  <!--
+    Standard, NOT Background. ProcessType is a scheduling contract, and
+    Background means "throttle this thing's CPU and I/O; nobody is waiting".
+    That is wrong for a five and a half minute headed browser session: it
+    would stretch page loads, push renders past the readiness timeouts this
+    script measured, and turn slow boards into FAIL rows carrying a
+    zero-anchor error that says nothing about the real cause.
+  -->
+  <key>ProcessType</key><string>Standard</string>
+
+  <!--
+    launchd must NOT treat the browser as its own child to clean up. Playwright
+    spawns Chrome detached, into its own session, and a capture run is a tree
+    of processes rather than one. With this false, launchd can reap that tree
+    out from under a run that is part way through a board. Teardown is the
+    wrapper's job instead: run_capture.sh walks the parent and child chain
+    itself and kills it thoroughly, on timeout and on SIGTERM.
+  -->
+  <key>AbandonProcessGroup</key><true/>
+
+  <!--
+    THE BOARD DOES NOT RENDER HEADLESS. Measured twice: headless renders the
+    page shell and the leaderboard XHR never fires, so there is nothing to
+    capture. That is settled (PLAN.md, RESOLVED BY MEASUREMENT 2, and
+    launch_browser's docstring); HEADLESS stays False and nothing here should
+    try to work around it.
+
+    So this job REQUIRES a real logged in GUI session, and Aqua is how that
+    requirement is stated to launchd. Loaded into a background or pre-login
+    session type there is no window server to draw into, and the failure is
+    not a clean refusal: it is a run that produces 22 FAIL rows for a reason
+    no column explains.
+  -->
+  <key>LimitLoadToSessionType</key><string>Aqua</string>
+
+  <!--
+    An explicit, absolute PATH. A launch agent's inherited PATH is minimal and
+    is not what a login shell has. run_capture.sh names every binary it uses
+    absolutely, so this is not what the wrapper depends on; it is what
+    anything FURTHER down depends on, including Playwright's node driver and
+    Chrome itself. Four system directories, nothing added: the venv python,
+    the driver and the browser are all invoked by absolute path, so there is
+    nothing to gain by widening this and a version skew to lose.
+  -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <!--
+    ExitTimeOut is how long launchd waits after SIGTERM before SIGKILL when it
+    stops this job. The default of 20s is too short here: on SIGTERM the
+    wrapper kills the whole capture tree, and that takes the 10s grace period
+    it gives Chrome to shut down cleanly plus the SIGKILL pass afterwards. 90s
+    is that teardown with room to spare on a loaded machine. Too short and
+    launchd SIGKILLs the wrapper mid teardown, which is precisely how a headed
+    Chrome gets abandoned on screen.
+  -->
+  <key>ExitTimeOut</key><integer>90</integer>
+
+  <!--
+    The floor under how often this job may be RELAUNCHED. launchd defaults to
+    10s. 300s here because RunAtLoad means every bootout and bootstrap cycle,
+    and every wake, fires the job again.
+
+    WHAT THE CHEAP PATH ACTUALLY IS, stated as the code now behaves rather
+    than as it was once hoped to. A run whose boards are all already captured
+    for today reads captures.csv, stats the raw files those rows name, finds
+    nothing to do and exits 0 WITHOUT LAUNCHING A BROWSER -- milliseconds of
+    work, no window on screen. That is preflight_skip() in
+    capture_leaderboard.py, and it is what makes firing on every wake
+    affordable.
+
+    IT IS NOT THE ONLY PATH, and 300s does not bound the other one. Within one
+    capture's worth of time of UTC midnight (MAX_CAPTURE_SECONDS, about six
+    minutes), the pre-flight deliberately refuses to guess which date a
+    capture would land on, so the run falls through to a full browser session
+    -- 22 page loads, about 332 seconds measured -- before it can decide to
+    write nothing. The same is true of any run that genuinely has a board to
+    capture. ThrottleInterval does not and cannot cap that; what caps it is
+    that launchd will not start a second copy of a label that is already
+    running, and that capture_leaderboard.py takes a run-wide lock so a
+    by-hand run overlapping a launchd run stands down instead of duplicating.
+
+    So what this value buys is narrow and worth stating narrowly: a hard floor
+    on how often a WAKE STORM can start the job at all. It cannot delay the
+    real work -- five minutes is nothing against a 24h cadence. It IS visible
+    when testing by hand: repeated `launchctl kickstart` calls inside five
+    minutes will be held off, and that is the intended behaviour, not a fault.
+  -->
+  <key>ThrottleInterval</key><integer>300</integer>
+</dict>
+</plist>

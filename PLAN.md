@@ -60,9 +60,31 @@ The most important section. Everything here is a thing not to build.
    Rows are also variable height: rank 38 carries an extra `+1` badge line, and rows
    without an X account show a truncated address (`Cqu5...QSsR`) where the handle
    goes — that is not a handle and must be stored as empty.
-4. **Timeframes: 1, 7, 14, 30.** Not 90 (yields no non-overlapping pair in 60 days).
-5. **Platforms: all of them.** `/leaderboard/<slug>` for fomo, axiom, photon, bloom,
-   gmgn, pumpfun, terminal, kolscan — same layout, one parser, a list of slugs.
+4. **Timeframes: 1, 7, 30.** Not 90 (yields no non-overlapping pair in 60 days).
+   **AMENDED 2026-09-18 by measurement: 14 is dropped — `days=14` does not return a
+   14-day board.** The 14D response is byte-identical to the 7D response on all six
+   platforms that serve both (same sha256, same wallet order, same `nextCursor`), and
+   in-band `max(period.tradingDays)` is 7 on every 14D body against 30 on every 30D
+   body — so the site holds the history and serves a 7-day window anyway. Confirmed
+   server-side and order-independent: captured 14D first and cold in a fresh profile,
+   45s before any `days=7` request existed in the session, same bytes. The request
+   genuinely carries `days=14` and the tab click genuinely lands (`14D=true` in the
+   DOM), so no request-side check can detect this — only the payload can.
+   One 14D capture of fomo only is kept per run as a **canary**, to notice if the site
+   ever starts serving a real 14-day window. It is not part of the measurement.
+5. **Platforms: fomo, axiom, photon, bloom, gmgn, pumpfun, terminal.**
+   `/leaderboard/<slug>` — same layout, one parser, a list of slugs.
+   **AMENDED 2026-09-18 by measurement, two exceptions:**
+   - **`pumpfun` needs a slug -> wire mapping.** The page slug is `pumpfun`; the API
+     platform is `pumpfun-app`. `/leaderboard/pumpfun-app` 404s, so both names are
+     correct for their own layer. A slug is therefore a (page_slug, wire_platform)
+     pair, identical for every platform but this one.
+   - **`kolscan` is dropped — it is a different instrument, not a missing board.**
+     Its page contains no `/dapi/` reference of any kind, no timeframe tabs, and 50
+     server-rendered wallet addresses (not 100 via XHR). The 1D and 30D pages render
+     an identical list; the timeframe is inert. There is nothing to observe on the
+     wire and no timeframe to select, so it cannot join a rank-persistence
+     measurement between timeframed windows. Revisit separately if wanted.
 6. **Scheduling:** macOS cron does not run while asleep and does not catch up. Use a
    launchd agent with `StartCalendarInterval` AND `RunAtLoad`, and make the script
    idempotent per UTC date so firing on wake, on unlock and by hand all produce
@@ -74,9 +96,12 @@ The most important section. Everything here is a thing not to build.
 
 Three artifacts. Raw is primary; CSV is derived.
 
-**`raw/<YYYY-MM-DD>/<capture_id>.html`** — the rendered page source, byte-for-byte,
-written before anything is parsed. Plus one `<date>-page.txt` per day for the
-disclaimer tripwire. Never rewritten.
+**`raw/<YYYY-MM-DD>/<capture_id>.json`** — the XHR response body, the wire bytes.
+PRIMARY. **`raw/<YYYY-MM-DD>/<capture_id>.html`** — the rendered page source, a DOM
+re-serialisation. Both written and fsynced (with their directories) before the
+manifest row that pins them. Plus one `<date>-page.txt` per day for the disclaimer
+tripwire. Never rewritten. A capture that is refused writes its observed bodies as
+`<capture_id>.refused-<n>.json`, named and hashed in `notes`, never in `raw_json_*`.
 
 **`captures.csv`** — the manifest. Append-only, hash-chained. One row per
 (platform, timeframe, attempt):
@@ -85,8 +110,17 @@ disclaimer tripwire. Never rewritten.
 capture_id, captured_at_utc, capture_date_utc, platform, timeframe_days,
 sort, direction, min_trades, min_days, source_url, method,
 status (OK|FAIL), row_count, raw_path, raw_sha256, page_text_sha256,
-parser_version, error, prev_hash, row_hash
+parser_version, error, schema_version, raw_json_path, raw_json_sha256,
+capture_role, notes, prev_hash, row_hash
 ```
+
+25 columns as of 2026-09-18. `platform` records the WIRE name (so `pumpfun-app`,
+matching that row's own `source_url` with no lookup). `capture_role` is blank for a
+measured capture and `canary` for one that is not part of the measurement. `notes`
+carries the nav/readiness trace and refused-body descriptions — always written, never
+a substitute for `error`. `schema_version` blank means v1 and means the later columns
+are empty; a blank-version row carrying them is invalid. Columns may be ADDED; a
+migration that would DROP one fails loudly and changes nothing.
 
 `min_trades=20` / `min_days=3` are a SELECTION RULE, not metadata — they define the
 population being measured. Record them per capture alongside the URL observed on the
@@ -199,6 +233,17 @@ Invariants. Not one is a number measured in a pre-run.
 10. Every manifest row records a `source_url` observed on the wire whose `days`
     parameter equals that row's `timeframe_days`.
 11. The process exits nonzero iff at least one capture in the run is not OK.
+    **AMENDED 2026-09-19 — the wording above is SUPERSEDED by the step 5
+    idempotence guard.** It now reads: *"exits nonzero iff at least one capture that
+    was attempted did not land OK; a capture skipped because that date already has an
+    OK row is accounted for, not a failure."* The original wording predates the skip
+    and, read literally, makes a fully-skipped run a failure — and launchd fires this
+    job on every wake, so that would be a daily alarm meaning "there was nothing to
+    do", which trains a reader to ignore the alarm that means something. A skip is an
+    account, not an omission: it names in the log the OK row that already covers that
+    board for that UTC date, and invariant 12 is what makes it legitimate. The
+    accounting is unchanged in total — every capture in the matrix is either a
+    manifest row this run wrote or a skip.
 12. Running `capture` again the same UTC date adds no second capture for anything
     already OK that date.
 13. `status` names every UTC date since the first capture lacking an OK capture.
