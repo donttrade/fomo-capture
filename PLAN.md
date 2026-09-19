@@ -152,13 +152,32 @@ re-deriving it. One chain, over the thing that cannot be regenerated.
   maximus/                     <- UNTOUCHED
   fomo/
     .venv/                     <- its own venv
-    capture_leaderboard.py     <- ONE file, ~250 lines
+    capture_leaderboard.py     <- ONE file, ~2900 lines (see amendment below)
     captures.csv
     leaderboard.csv
     raw/2026-09-18/...
     logs/capture.log
     com.reine.fomocapture.plist -> symlinked into ~/Library/LaunchAgents/
 ```
+
+**AMENDED 2026-09-19 — "~250 lines" above is SUPERSEDED. It is kept, struck through
+by this note rather than deleted, because it records what was estimated and the gap
+between that and what got built is itself worth knowing.** The file is ~2900 lines.
+Roughly a sixth of that is code; the rest is the comment record.
+
+That density is DELIBERATE AND LOAD-BEARING, not accumulated mess, and it must not be
+"cleaned up" by someone counting lines. This instrument's failures are all silent
+ones — a positional parser that swaps two columns on every row forever, a `days=14`
+that quietly serves a 7-day board, a page slug that 404s under its own API name, a
+pre-flight skip that looks correct and loses a day at UTC midnight, a guard whose
+refusal a `finally` destroys into 22 FAIL rows with a chain that verifies perfectly.
+Not one of those is visible in the code that causes it. Each was found by measurement
+or by an adversarial test, and each is now written down beside the line it governs,
+together with what the naive alternative would have broken and what was actually
+observed. Delete the comment and the next person rediscovers the bug.
+
+The 250-line estimate was not wrong about the code. It was wrong about how much of a
+measurement instrument is the record of why it is shaped the way it is.
 
 Verbs: `capture` (default), `status`, `verify`, `rebuild`.
 

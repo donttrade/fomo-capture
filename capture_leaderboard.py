@@ -79,6 +79,21 @@ committed, this one included: raw/<date>/, raw/, and fomo/ itself. An fsync on
 a file commits that file's bytes and says nothing about the directory entry
 that gives it a name.
 
+AND NOTHING HERE TOUCHES THE NETWORK UNLESS SOMEONE ARMED IT ON PURPOSE. The
+environment variable FOMO_LIVE_CAPTURE must equal the string "1" or every path
+that would reach solanatracker.io refuses, loudly, with a nonzero exit and not
+one byte written. run_capture.sh -- the wrapper launchd runs -- is the only
+thing that exports it, and it checks its own export before it runs anything.
+See the LIVE-CAPTURE INTERLOCK block below for why the guard is on the network
+rather than on the data, and require_live_capture() for the three places it
+sits -- only the first of which fires as this file is shipped.
+
+TESTS MUST NEVER SET FOMO_LIVE_CAPTURE. A test that needs the capture path
+stubs fetch_page() or launch_browser(); the interlock is the instrument that
+proves the stub is really in front of the wire, and a test that arms it is a
+test that can silently spend two minutes hammering a live site -- which is
+exactly what happened on 2026-09-18 and is why the interlock exists.
+
 Not an analysis tool. Not a trading tool. Never calls git. Writes only inside
 this directory.
 """
@@ -116,6 +131,28 @@ RUN_LOCK_PATH = BASE_DIR / ".capture_run.lock"
 
 PARSER_VERSION = "0.1.0"
 SCHEMA_VERSION = "3"
+
+# ------------------------------------------------- the live-capture interlock --
+# THIS SCRIPT MAKES NO REQUEST TO solanatracker.io UNLESS SOMEONE SAID SO.
+#
+# THE INCIDENT. On 2026-09-18 a test script ran this file with no verb. The
+# verb defaults to "capture", so it fell straight through into a real run and
+# spent about two minutes loading live boards before it was killed. The test
+# was pointed at a sandbox manifest, and that was not enough -- and could never
+# have been enough, because a manifest decides WHAT gets captured and never
+# WHETHER anything is fetched. So the guard is on the network, not on the data.
+#
+# EXACT STRING MATCH, NOT TRUTHINESS, and this is the whole design. Python
+# treats every non-empty string as true, so `if os.environ.get(...)` would
+# ARM on FOMO_LIVE_CAPTURE=0 and on FOMO_LIVE_CAPTURE=false -- two spellings a
+# person would reach for precisely when they meant to turn it OFF. The only
+# value that arms this is the one character "1".
+#
+# READ ONCE, HERE, into a module-level constant, so every guard in the run
+# gives the same answer. Re-reading os.environ at each call site would let a
+# run change its mind halfway through and leave half a day's boards behind it.
+LIVE_CAPTURE_ENV = "FOMO_LIVE_CAPTURE"
+LIVE_CAPTURE_ARMED = os.environ.get(LIVE_CAPTURE_ENV) == "1"
 
 # ------------------------------------------------------------ the matrix --
 # PLAN.md, RESOLVED BY MEASUREMENT 4 and 5, as amended 2026-09-18.
@@ -306,40 +343,85 @@ MATCHING_XHR_TIMEOUT_MS = 30_000  # waiting for a response whose days match
 READY_TIMEOUT_MS = 45_000
 LOCK_TIMEOUT_S = 120
 
-# THE LONGEST ONE CAPTURE CAN TAKE, in seconds, before its own timeouts kill
-# it. Composed from the constants above and never guessed, because this number
-# is what lets the cheap pre-flight skip (preflight_skip) be SURE that the
-# capture it is declining to run would have been stamped with the same UTC
-# date it just read from the clock.
+# THE LONGEST ONE CAPTURE CAN TAKE TO REACH ITS OWN TIMESTAMP, in seconds.
+# This number is what lets the cheap pre-flight skip (preflight_skip) be SURE
+# that the capture it is declining to run would have been stamped with the same
+# UTC date it just read from the clock.
 #
-# fetch_page() pays these waits one after another, and every one is a ceiling:
+# SO IT MUST BOUND THE PATH TO THE STAMP, AND ONLY THAT PATH. The stamp is
+# `now` in capture_one(): either the matching XHR's received_at, stamped in
+# fetch_page's response handler, or -- when no matching body ever arrived --
+# evidence["harvested_at"], stamped on the line before page.content(). The
+# fallback is the later of the two, so bounding it bounds both.
 #
-#   page.goto                       NAV_TIMEOUT_MS             60s
-#   wait for the period tablist     TAB_TIMEOUT_MS             15s
-#   click that tab                  TAB_TIMEOUT_MS             15s
-#   wait for a matching days= XHR   MATCHING_XHR_TIMEOUT_MS    30s
-#   wait for the board to render    READY_TIMEOUT_MS           45s
-#   the post-render settle          API_SETTLE_MS               3s
-#   content + anchors + inner_text  3 x NAV_TIMEOUT_MS        180s
-#                                                            -----
-#                                                             348s
+# WHAT IS NOT IN THE SUM: page.content(), query_selector_all() and
+# inner_text(). All three run AFTER harvested_at is stamped, so however long
+# they take they cannot move capture_date by one second. An older derivation
+# charged 180s for them, which was 180s of bound spent on calls that cannot
+# affect the thing being bounded.
 #
-# The last line is page.content(), query_selector_all() and inner_text(),
-# which take no timeout of their own and inherit
-# page.set_default_timeout(NAV_TIMEOUT_MS).
+# WHAT IS IN IT, read off fetch_page() and select_timeframe() in call order.
+# Every term here is a ceiling THIS FILE SETS, so changing a timeout constant
+# above changes this sum with it:
 #
-# A measured capture takes about 15s, so this bound is roughly 23x the real
-# thing. That slack is deliberate and it is asymmetric on purpose: being too
-# generous here costs at most one extra page load near UTC midnight, while
-# being too tight costs a board its day, permanently.
-MAX_CAPTURE_SECONDS = (
-    NAV_TIMEOUT_MS
-    + 2 * TAB_TIMEOUT_MS
-    + MATCHING_XHR_TIMEOUT_MS
-    + READY_TIMEOUT_MS
-    + API_SETTLE_MS
-    + 3 * NAV_TIMEOUT_MS
-) / 1000.0
+#   page.goto                       NAV_TIMEOUT_MS              60s
+#   wait for the period tablist     TAB_TIMEOUT_MS              15s
+#   get_attribute("aria-selected")  NAV_TIMEOUT_MS              60s
+#   click that tab                  TAB_TIMEOUT_MS              15s
+#   wait for a matching days= XHR   MATCHING_XHR_TIMEOUT_MS     30s
+#   wait for the board to render    READY_TIMEOUT_MS            45s
+#   the post-render settle          API_SETTLE_MS                3s
+#                                                              ----
+#                                                              228s
+#
+# get_attribute is 60s and not 15s because select_timeframe() passes it no
+# explicit timeout, so it inherits page.set_default_timeout(NAV_TIMEOUT_MS).
+# Verified in the installed Playwright 1.60.0: _impl/_frame.py:731 sends
+# "getAttribute" with self._timeout, which is the page default.
+#
+# AND THREE CALLS ON THIS PATH HAVE NO CEILING AT ALL. This is the part the
+# derivation used to get wrong: it opened with 30s for context.new_page(),
+# attributed to "Playwright's own default timeout", and that default does not
+# apply. Verified by reading the installed Playwright 1.60.0 -- each of these
+# passes `None` where the timeout calculator belongs, which means NO timeout
+# is sent to the driver and nothing bounds the round trip:
+#
+#   context.new_page()   _browser_context.py:343   send("newPage", None)
+#   locator.count()      _frame.py:139             send("queryCount", None)
+#   response.body()      _network.py:921           send("body", None)
+#
+# Compare _frame.py:157, where goto passes self._navigation_timeout: that is
+# what a bounded call looks like in the same library. The old note that
+# Locator.count() "does not auto-wait" is still true -- it answers with
+# however many elements match right now -- but not auto-waiting is not the
+# same as costing nothing, because it is still an unbounded round trip.
+# response.body() is unbounded too, and it runs INSIDE the response handler,
+# which is before received_at is used and can happen more than once per page.
+#
+# So the budget is two numbers that mean different things, and they are kept
+# apart so the next reader can see which half is derived and which is judged:
+#
+#   MAX_CAPTURE_BOUNDED_MS -- 228s. Arithmetic over this file's own constants.
+#   MAX_CAPTURE_SLACK_MS   -- 120s. Cover for the three unbounded round trips
+#                             above, plus ordinary slowness. A judgement, and
+#                             it cannot be anything else while those three
+#                             calls send no timeout at all.
+#
+# 348.0s IS THE VALUE THIS CONSTANT HAS ALWAYS HAD, and it does not move here.
+# A real measured capture is about 15s, so the bound is already ~23x the real
+# thing. Being too generous costs at most one extra page load per day near UTC
+# midnight; being too tight costs a board its day, permanently.
+MAX_CAPTURE_BOUNDED_MS = (
+    NAV_TIMEOUT_MS                  # page.goto
+    + TAB_TIMEOUT_MS                # wait_for_selector: the period tablist
+    + NAV_TIMEOUT_MS                # locator.get_attribute("aria-selected")
+    + TAB_TIMEOUT_MS                # locator.click: the timeframe tab
+    + MATCHING_XHR_TIMEOUT_MS       # wait_for_matching_response
+    + READY_TIMEOUT_MS              # wait_for_selector: the board rendered
+    + API_SETTLE_MS                 # the post-render settle
+)
+MAX_CAPTURE_SLACK_MS = 120_000
+MAX_CAPTURE_SECONDS = (MAX_CAPTURE_BOUNDED_MS + MAX_CAPTURE_SLACK_MS) / 1000.0
 
 GENESIS_PREV_HASH = "0" * 64
 
@@ -425,6 +507,106 @@ class ManifestIntegrityError(RuntimeError):
     are -- they are the evidence that a capture happened, and they are
     re-parseable later once the manifest is repaired by hand.
     """
+
+
+class LiveCaptureDisarmedError(RuntimeError):
+    """Something tried to reach the live site and the interlock said no.
+
+    A DISTINCT CLASS, and that is the single most important thing about it.
+    run_captures() wraps every capture in `except Exception` and turns what it
+    catches into a FAIL row. If the interlock raised a plain exception there, a
+    disarmed run would append 22 FAIL rows to an APPEND-ONLY record that cannot
+    be edited afterwards -- permanently writing a lie about 22 boards into the
+    hash chain, which is far worse than the live traffic this guard exists to
+    stop. So it is re-raised by name in that handler chain, exactly the way
+    ManifestIntegrityError is, and answered in capture_run().
+
+    WHAT IS GUARANTEED, AND BY WHAT. These are not all guaranteed by the same
+    thing, and an earlier version of this docstring listed them as if they
+    were:
+
+      * Zero manifest rows -- guaranteed by THIS CLASS. Being a distinct type
+        is what lets the handler chain re-raise it by name instead of writing
+        it down.
+      * Nonzero exit -- guaranteed by capture_run(), which catches it above
+        the generic handler and returns 1.
+      * Zero raw files -- NOT a property of this exception at all. It is a
+        property of WHERE THE GUARDS SIT. Raise this from a point after
+        write_durably() has put an .html on disk and you get an orphan file
+        that no manifest row names, and the class cannot prevent that. It
+        cannot happen today because every guard precedes every write: guard 1
+        before a browser exists, guard 2 before one opens, guard 3 before the
+        page exists. A new call site has to preserve that ordering itself.
+    """
+
+
+def live_capture_env_display():
+    """The environment variable exactly as this process sees it, for a message.
+
+    "unset" and the empty string are different diagnoses -- the first means
+    nobody exported it, the second means something exported it as nothing --
+    so they are never collapsed into one word.
+    """
+    raw = os.environ.get(LIVE_CAPTURE_ENV)
+    return "unset" if raw is None else repr(raw)
+
+
+def require_live_capture(attempted):
+    """Refuse `attempted` unless FOMO_LIVE_CAPTURE is armed. See LIVE_CAPTURE_ENV.
+
+    THREE CALL SITES, AND ONLY THE FIRST ONE EVER FIRES as this file is
+    shipped. All three read the same module-level LIVE_CAPTURE_ARMED, which is
+    fixed at import and cannot change mid-run, so in a disarmed run guard 1 in
+    run_captures() refuses before a browser exists and guards 2 and 3 are
+    simply never reached. They are NOT live redundancy, and an earlier version
+    of this docstring claimed they were.
+
+    What they are is insurance against a call path that does not exist yet.
+    Guard 1 sits on one particular route to the wire -- the matrix loop in
+    run_captures() -- and a future route that opened a browser or navigated a
+    page by some other means would sail straight past it. Guard 2 is on the
+    browser, guard 3 is on the egress itself, which is the last place any new
+    route can still be stopped. Three cheap calls against a repeat of
+    2026-09-18 is not a close trade.
+    """
+    if LIVE_CAPTURE_ARMED:
+        return
+    raise LiveCaptureDisarmedError(
+        "%s was REFUSED because %s is not set to \"1\" in this process's "
+        "environment (it is %s). THIS IS A DELIBERATE SAFETY INTERLOCK, NOT A "
+        "BUG and not a broken install: this script will not make a single "
+        "request to the live leaderboard site unless someone armed it on "
+        "purpose, because `capture` is the default verb and a test that "
+        "forgets to say otherwise would otherwise spend minutes hammering a "
+        "real website. TO ARM IT FOR A REAL RUN: use ./run_capture.sh, which "
+        "is the sanctioned entry point and exports it for you, or for a "
+        "one-off by hand run `%s=1 .venv/bin/python capture_leaderboard.py "
+        "capture`. IF YOU ARE WRITING A TEST, DO NOT SET IT -- stub "
+        "fetch_page() or launch_browser() instead."
+        % (attempted, LIVE_CAPTURE_ENV, live_capture_env_display(),
+           LIVE_CAPTURE_ENV))
+
+
+def log_capture_mode():
+    """ONE line, at the start of EVERY run, saying which mode is in force.
+
+    Logged whether or not anything is captured, and that is the requirement.
+    A launchd job whose wrapper quietly lost the export would otherwise look
+    identical to a normal already-done morning: both exit 0, both write
+    nothing. This line is what makes the difference visible in the log the
+    next morning instead of three weeks later.
+    """
+    if LIVE_CAPTURE_ARMED:
+        log.info("live capture ARMED (%s=%s): this run MAY open a browser and "
+                 "make requests to the live leaderboard site.",
+                 LIVE_CAPTURE_ENV, live_capture_env_display())
+    else:
+        log.info("live capture DISARMED (%s is %s): this run will refuse to "
+                 "open a browser or fetch any page. Boards already captured "
+                 "for today are still skipped normally, because skipping "
+                 "touches no network; anything that actually needs capturing "
+                 "will end this run with a nonzero exit and nothing written.",
+                 LIVE_CAPTURE_ENV, live_capture_env_display())
 
 
 # ------------------------------------------------------- row-level validity --
@@ -1131,14 +1313,59 @@ def url_matches_capture(url, platform, timeframe_days):
             and pick_param(url, PLATFORM_KEY_CANDIDATES).strip() == platform)
 
 
+def stdout_is_a_terminal():
+    """sys.stdout.isatty(), except it can never be the reason there is no log.
+
+    MEASURED, both of them: the bare call raises AttributeError when
+    sys.stdout is None, which is what Python hands you if fd 1 was closed at
+    exec time (`./run_capture.sh 1>&-`), and ValueError when stdout is an
+    already-closed file object. Either one is raised from inside
+    setup_logging() BEFORE a single handler is attached, so the process dies
+    with NOTHING in capture.log -- and the first line it loses is
+    log_capture_mode()'s, which on a day whose boards are already captured is
+    the only thing that tells a disarmed run from an armed one.
+
+    Unreachable under launchd, which always hands the job a regular file for
+    stdout. That is not a reason to leave it: a logging setup must never be
+    the thing that prevents the log from existing. Any failure answers "not a
+    terminal", which at worst loses a terminal echo nobody was there to read.
+    """
+    try:
+        return sys.stdout.isatty()
+    except Exception:                                 # noqa: BLE001
+        return False
+
+
 def setup_logging():
+    """logs/capture.log always; the terminal only when there IS a terminal.
+
+    THE ECHO IS CONDITIONAL, and it was not always. Every line went to stdout
+    unconditionally, and under launchd stdout is logs/launchd.log -- so
+    measured after the last fix, 226 of the 226 lines in launchd.log were
+    byte-identical copies of lines in capture.log. No single file was doubled,
+    which was the original defect and is genuinely gone, but the run still
+    cost about twice the bytes it needed to and the two files were 98%
+    the same file.
+
+    So the echo is attached only when stdout is a terminal, which is exactly
+    the case it exists for: a person running ./run_capture.sh by hand wants to
+    watch it work. Under launchd stdout is a file, stdout_is_a_terminal() is
+    False, no handler is added, and launchd.log gets what only it can carry
+    -- the wrapper's banners, a traceback from an import that died before
+    logging was configured, and Playwright's and Chrome's own stderr.
+
+    IT GOES TO stderr, NOT stdout. Log lines are diagnostics, and keeping them
+    off stdout means a future `status` or `verify` verb can print a result a
+    person could pipe somewhere without the run's narration mixed into it.
+    """
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     fmt = logging.Formatter("%(asctime)sZ %(levelname)s %(message)s")
     fmt.converter = lambda *a: datetime.now(timezone.utc).timetuple()
     log.setLevel(logging.INFO)
-    for handler in (logging.FileHandler(LOG_DIR / "capture.log",
-                                        encoding="utf-8"),
-                    logging.StreamHandler(sys.stdout)):
+    handlers = [logging.FileHandler(LOG_DIR / "capture.log", encoding="utf-8")]
+    if stdout_is_a_terminal():
+        handlers.append(logging.StreamHandler(sys.stderr))
+    for handler in handlers:
         handler.setFormatter(fmt)
         log.addHandler(handler)
 
@@ -1157,6 +1384,11 @@ def launch_browser(pw):
     leaderboard XHR never fires. `method` reports the flags actually in force,
     never a guess.
     """
+    # INTERLOCK, guard 2 of 3. A browser is not egress by itself, but it is
+    # the door every capture walks through, and a Chrome window appearing on
+    # screen during a test run is the first visible sign that something is
+    # about to go and fetch real pages. Nothing opens while disarmed.
+    require_live_capture("launching a browser")
     try:
         channel = "chrome"
         browser = pw.chromium.launch(channel=channel, headless=HEADLESS,
@@ -1292,6 +1524,39 @@ def fetch_page(context, page_slug, platform, timeframe_days):
         except Exception as exc:                      # noqa: BLE001
             record["body_error"] = "%s: %s" % (type(exc).__name__, exc)
         observed.append(record)
+
+    # INTERLOCK, guard 3 of 3, AND THE ONE THAT SITS ON THE EGRESS ITSELF.
+    # Everything past this line is a real browser doing real work against the
+    # live site; everything before it is local. A future code path that
+    # reaches navigation without ever going through launch_browser() -- a
+    # second browser, a reused context, whatever it turns out to be -- is
+    # still stopped right here, which is what makes adding a call site later
+    # unable to silently reopen the hole.
+    #
+    # IT SITS ABOVE context.new_page(), AND THAT PLACEMENT IS THE WHOLE POINT,
+    # because there are TWO separate mechanisms below that can eat a refusal:
+    #
+    #   1. The `except Exception` around page.goto() turns anything it catches
+    #      into a nav `problem` string and carries on to write a FAIL row. A
+    #      refusal swallowed there puts the interlock's own message into the
+    #      manifest, 22 times.
+    #   2. Worse, and far less obvious: the `finally: page.close()` at the
+    #      bottom of this function. Python REPLACES an in-flight exception
+    #      with any exception raised in a `finally`, and page.close() can
+    #      raise -- "Target page, context or browser has been closed" is an
+    #      ordinary Playwright error. So a refusal raised anywhere inside that
+    #      try could be destroyed on the way out and arrive at run_captures()
+    #      as a plain RuntimeError, which is caught, turned into a FAIL row,
+    #      and appended once per board to an APPEND-ONLY record -- 22 rows
+    #      reading "capture raised RuntimeError: ...", with a hash chain that
+    #      verifies perfectly. Guard 3 being merely outside handler 1 was not
+    #      enough to stop that; only being outside the try entirely is.
+    #
+    # Raised HERE, no page has been created, the try below is never entered,
+    # no finally runs, and there is no mechanism left that can mask the
+    # refusal. Nothing stands between this line and context.new_page(). KEEP
+    # IT ABOVE THAT LINE.
+    require_live_capture("navigating to %s" % url)
 
     page = context.new_page()
     try:
@@ -1821,11 +2086,16 @@ def read_ok_captures():
     AN OK ROW ONLY ENTERS THE MAP IF ITS EVIDENCE IS ON DISK. The map is the
     licence to NOT capture a board, so every entry in it has to be backed by
     files -- see missing_evidence() for what is checked and what is
-    deliberately left to `verify`. A row that fails that check is not in the
-    map, which means its board is captured again today, which is the only
-    outcome that gets the bytes back.
+    deliberately left to `verify`. A row that fails that check does not put its
+    capture_id in the map. Whether its board is then captured again depends on
+    whether some OTHER intact OK row claims the same key: usually nothing else
+    does and the board is recaptured, which is the only outcome that gets the
+    bytes back, but a duplicate from before the idempotence guard existed can
+    cover for it. log_rejected_ok_rows() says which of the two happened, per
+    row, and does not guess.
     """
     ok = {}
+    rejected = []          # (row, key, gaps) for every OK row refused as proof
     if not MANIFEST_PATH.exists():
         return ok
     with manifest_lock():
@@ -1833,26 +2103,87 @@ def read_ok_captures():
             for row in csv.DictReader(fh):
                 if str(row.get("status") or "").strip() != "OK":
                     continue
-                gaps = missing_evidence(row)
-                if gaps:
-                    # Its own line, at WARNING, naming the row and the file:
-                    # an OK row whose bytes are gone is a real anomaly, and
-                    # silently recapturing would hide it. The recapture is the
-                    # right response; being quiet about it is not.
-                    log.warning(
-                        "OK row NOT accepted as proof and its board will be "
-                        "captured again today: %s -- %s",
-                        row_label(row), "; ".join(gaps))
-                    continue
                 key = capture_key(row.get("platform"),
                                   row.get("timeframe_days"),
                                   row.get("capture_role"),
                                   row.get("capture_date_utc"))
+                gaps = missing_evidence(row)
+                if gaps:
+                    # PARKED, NOT LOGGED YET -- see log_rejected_ok_rows() for
+                    # why the message cannot be written until the whole file
+                    # has been read.
+                    rejected.append((row, key, gaps))
+                    continue
                 # Last OK row for a key wins. With the guard working there is
                 # never more than one, and if history contains duplicates from
                 # before it existed, the newest is the one worth naming.
                 ok[key] = str(row.get("capture_id") or "")
+    log_rejected_ok_rows(rejected, ok)
     return ok
+
+
+def log_rejected_ok_rows(rejected, ok):
+    """One WARNING per OK row refused as proof, saying what ACTUALLY follows.
+
+    An OK row whose bytes are gone is a real anomaly and must never be passed
+    over in silence -- so every one of them gets its own line, naming the row
+    and naming the file.
+
+    WHY THIS RUNS AFTER THE WHOLE MANIFEST IS READ, and why the old message
+    was a lie. It used to say "its board will be captured again today", logged
+    the instant the row was refused. But a refusal only forces a recapture
+    when NO other intact OK row covers the same key -- same platform,
+    timeframe, role and UTC date -- and whether such a row exists cannot be
+    known from inside the loop: the covering row may sit anywhere in the file,
+    before this one or after it. So in the ordinary rescue case the log
+    promised a recapture that then, correctly, never happened, and a reader
+    checking captures.csv for it found nothing and had to wonder which of the
+    two the instrument had got wrong.
+
+    Now the two cases are told apart, and each says only what is true:
+
+      * COVERED -- an intact row for the same key survived the scan, so the
+        board is NOT captured again. The message names that row's capture_id
+        so the claim is checkable on the spot.
+      * UNCOVERED -- nothing else covers that key, so that board is not proven
+        captured for today and is DUE for capture in this run.
+
+    AND THE UNCOVERED MESSAGE PROMISES NOTHING ABOUT WHAT HAPPENS NEXT, which
+    is the second way it managed to be wrong. It used to say the board "WILL
+    be captured again today". This function runs inside read_ok_captures(),
+    which runs BEFORE the live-capture interlock's first guard in
+    run_captures() -- so a DISARMED run reaches this line, promises the
+    recapture, and then a few lines later refuses the whole run and writes
+    nothing at all. The log contradicted itself in the space of one screen.
+
+    So the message states what the ROW IS -- not accepted as proof, therefore
+    that board is due -- and leaves what the run actually does to the mode
+    line at the top of the log and to the exit code. That sentence is true in
+    an armed run and true in a disarmed one.
+    """
+    for row, key, gaps in rejected:
+        platform, timeframe_days, role, date_utc = key
+        covering_capture_id = ok.get(key)
+        if covering_capture_id:
+            log.warning(
+                "OK row REJECTED as proof: %s -- %s. Its board is NOT "
+                "captured again today: another intact OK row covers %s %sD "
+                "[%s] for %s (capture_id=%s). The rejected row's missing "
+                "bytes are still an anomaly worth looking at.",
+                row_label(row), "; ".join(gaps), platform, timeframe_days,
+                role, date_utc, covering_capture_id)
+        else:
+            log.warning(
+                "OK row REJECTED as proof: %s -- %s. No other intact OK row "
+                "covers %s %sD [%s] for %s, so that board is NOT proven "
+                "captured for today and is DUE for capture in this run. "
+                "Whether this run then takes it is a separate question this "
+                "line does not answer -- an armed run captures it, a disarmed "
+                "run refuses and writes nothing; the mode line at the top of "
+                "this log says which. Recapturing is the right response; "
+                "being quiet about it is not.",
+                row_label(row), "; ".join(gaps), platform, timeframe_days,
+                role, date_utc)
 
 
 def seconds_to_utc_midnight(moment):
@@ -1892,8 +2223,9 @@ def preflight_skip(item, already_ok, moment):
 
       1. the key is OK for the UTC date it is now, and
       2. UTC midnight is further away than the longest a single capture can
-         take -- MAX_CAPTURE_SECONDS, composed from this script's own
-         timeouts, about 348 seconds.
+         take -- MAX_CAPTURE_SECONDS: this script's own timeouts plus
+         slack for three Playwright calls that carry no timeout at all,
+         about 348 seconds.
 
     Condition 2 is checked at the moment the capture would START, not once for
     the whole run, which is what makes a per-capture bound the right bound: if
@@ -2336,6 +2668,32 @@ def run_captures():
                  "was launched.", len(skipped), capture_date(now))
         return rows, skipped
 
+    # INTERLOCK, guard 1 of 3: fail fast, before any of the work.
+    #
+    # THE ORDERING IS THE DECISION. This sits AFTER the all-skip return above
+    # and not at the top of the run, because the pre-flight touches no network
+    # whatsoever -- it reads captures.csv and stats files -- so a run whose
+    # boards are all already captured for today is a run that was never going
+    # to fetch anything, and it must still exit 0 while disarmed. That is the
+    # ordinary launchd-on-wake morning, and yesterday's 07:30 fire, with its
+    # 22 pre-flight skips and no browser, would still exit 0 under this code.
+    # Refusing it would turn a working system into a daily alarm.
+    #
+    # Reaching this line means the opposite: at least one board genuinely
+    # needs capturing, so this run WOULD touch the network. Nothing has been
+    # written yet and no browser exists yet, so refusing here costs
+    # milliseconds and leaves zero side effects.
+    #
+    # THE RESIDUAL, stated plainly because it is real: a disarmed run on an
+    # already-complete day exits 0 and looks exactly like a healthy one. That
+    # is precisely why log_capture_mode() prints the mode at the start of
+    # EVERY run -- the mode line, not the exit code, is what tells you a
+    # launchd job has been mis-armed for a week.
+    needed = len([decision for decision in preflight if decision is None])
+    require_live_capture(
+        "capturing %d of the %d board(s) in the matrix"
+        % (needed, len(items)))
+
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as pw:
@@ -2371,6 +2729,14 @@ def run_captures():
                         result = capture_one(context, method, item,
                                              compare_sha, pending, already_ok)
                     except ManifestIntegrityError:
+                        raise
+                    except LiveCaptureDisarmedError:
+                        # RE-RAISED, exactly like ManifestIntegrityError above
+                        # and for the same reason: turning it into a FAIL row
+                        # would append the interlock's refusal to an
+                        # append-only record, once per board, and the record
+                        # would then claim 22 boards were attempted and failed
+                        # when nothing was attempted at all.
                         raise
                     except Exception as exc:          # noqa: BLE001
                         result = failed_capture_row(
@@ -2446,6 +2812,9 @@ def main():
     ap.add_argument("verb", nargs="?", default="capture", choices=["capture"])
     ap.parse_args()
     setup_logging()
+    # BEFORE the run lock, so even a second process that stands down leaves a
+    # record of which mode it was in. See log_capture_mode().
+    log_capture_mode()
     with run_lock() as acquired:
         if not acquired:
             # NOT AN ERROR, and the log must not let anyone think it was.
@@ -2473,6 +2842,20 @@ def capture_run():
         # capture that should replace it. See check_manifest_tail_before_run().
         check_manifest_tail_before_run()
         rows, skipped = run_captures()
+    except LiveCaptureDisarmedError as exc:
+        # NONZERO, because this is a REFUSAL and not a skip. A run that needed
+        # to capture a day's boards and did not must never be mistakable for a
+        # clean one: if run_capture.sh ever loses the export, this is the exit
+        # code that makes the wrapper's finish banner say so in launchd.log,
+        # rather than the job quietly doing nothing every morning until
+        # somebody notices a gap in captures.csv weeks later.
+        #
+        # Caught BEFORE the bare `except Exception` below, which would
+        # otherwise flatten it into a generic "capture run failed".
+        log.error("LIVE CAPTURE DISARMED: %s", exc)
+        log.error("Nothing was written: no raw file, no manifest row, no "
+                  "chain link. captures.csv is byte-for-byte unchanged.")
+        return 1
     except ManifestIntegrityError as exc:
         # Loud on purpose, and specific: the message names the file, the line
         # and what is wrong with it. Nothing was appended -- see

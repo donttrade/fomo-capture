@@ -26,13 +26,21 @@
 #
 # THE TIMEOUT IS 1800 SECONDS, and that number is decided, not derived here.
 # Today's measured run was 331.6s of wall clock for 22 captures, about 15s
-# each. 1800s is roughly 5.4x that. The margin absorbs a cold Chrome launch, a
-# slow network, and the script's own two-attempt retries, so the watchdog never
-# kills a run that is merely slow -- which would throw away boards that were
-# about to land, on a day that cannot be re-collected. At the same time 1800s
-# is far below the 24h gap to the next fire, so a wedged browser cannot sit on
-# .captures.lock until tomorrow's run and take that day down with it. The
-# failure this bounds is not slowness; it is a hang.
+# each. 1800s is roughly 5.4x that, and the margin is there for a cold Chrome
+# launch and for boards that are merely slow to render -- so the watchdog
+# never kills a run that was about to land its boards, on a day that cannot be
+# re-collected. At the same time 1800s is far below the 24h gap to the next
+# fire, so a wedged browser cannot sit on .captures.lock and .capture_run.lock
+# until tomorrow's run and take that day down with it too. The failure this
+# bounds is not slowness; it is a hang.
+#
+# THERE ARE NO RETRIES IN THAT MARGIN. An earlier version of this comment said
+# the budget also absorbed "the script's own two-attempt retries"; there are
+# none, and capture_leaderboard.py says so in as many words next to
+# INTER_CAPTURE_PAUSE_S: "There is no second attempt anywhere in this file."
+# PLAN.md puts backoff and retry queues out of scope. The only pause in a run
+# is a flat 2.5s of politeness between captures, which is already inside the
+# 331.6s measured above.
 #
 # macOS ships no timeout(1) and no gtimeout (checked with `which`: both
 # absent), so the watchdog is implemented below.
@@ -71,6 +79,20 @@ EXIT_TIMED_OUT=124
 # shell's own "command not found", which is what this is.
 EXIT_NOT_RUNNABLE=127
 EXIT_SIGNALLED=143
+# The export below did not take. Its own code because it is its own fault:
+# not 0/1 (the python's), not 124 (the watchdog), not 126/127 (the shell's
+# "cannot execute" / "not found"), not 143 (a signal). timeout(1) uses 125 for
+# "the wrapper itself failed", which is exactly what this is.
+#
+# ONE HAZARD, IF ANYTHING EVER PARSES THESE: 125 sits directly adjacent to 124,
+# the watchdog timeout above, and the two mean opposite things -- 124 is "the
+# capture ran too long and was killed mid-board", 125 is "the capture never
+# started because this wrapper could not arm it". An off-by-one in a reader, or
+# a glance at the wrong digit in a log, inverts the diagnosis. Nothing reads
+# them today; the banner line names the reason in words for exactly that
+# reason, and anything that starts matching on the number should match on the
+# banner text too.
+EXIT_NOT_ARMED=125
 
 # Set before any trap can fire: with `set -u`, a trap that reads an unset
 # variable kills the shell with a confusing error instead of doing its job.
@@ -231,6 +253,81 @@ cd "$FOMO_DIR" || {
 }
 
 started_epoch="$("$DATE" +%s)"
+
+# THE LIVE-CAPTURE INTERLOCK IS ARMED HERE, AND NOWHERE ELSE IN THE SYSTEM.
+#
+# capture_leaderboard.py refuses to open a browser or fetch a page unless
+# FOMO_LIVE_CAPTURE is exactly the string "1". That is deliberate: `capture` is
+# its default verb, so a test that invokes it with no arguments falls straight
+# through into a real run against solanatracker.io -- which is precisely what
+# happened on 2026-09-18, for about two minutes, before it was killed.
+#
+# WHY THIS LINE AND NOT THE PLIST'S EnvironmentVariables. This wrapper is the
+# sanctioned entry point and the one launchd invokes, so putting the export
+# here means there is exactly ONE path to the live site and it is auditable in
+# one place: grep the repository for FOMO_LIVE_CAPTURE and this is the only
+# thing that sets it. Split across the plist as well and there would be two
+# doors, one of them invisible to anyone reading the script.
+#
+# A disarmed run is not silent and is not a clean exit: the python logs which
+# mode is in force at the start of EVERY run and exits nonzero if it actually
+# had boards to capture. A day that needed capturing fails loudly rather than
+# quietly doing nothing.
+export FOMO_LIVE_CAPTURE=1
+
+# NOW CHECK THAT THE LINE ABOVE DID WHAT IT SAYS.
+#
+# THE VARIABLE'S NAME IS SPELLED OUT A SECOND TIME HERE ON PURPOSE. That
+# duplication IS the check -- DO NOT TIDY IT. The obvious cleanup is to put
+# the name in a shell variable and use it on both lines:
+#
+#     name="FOMO_LIVE_CAPTURE"; export "$name=1"; [ "${!name}" = "1" ]
+#
+# and that version is defeated by the exact typo it is meant to catch, because
+# one misspelling flows into both sides and they agree with each other about
+# the wrong name. Spelled independently, a typo on EITHER line makes the two
+# disagree and the run stops here. If you find yourself removing the
+# repetition, you are removing the protection.
+#
+# WHAT THIS BUYS AND WHAT IT DOES NOT. It is NOT what prevents live traffic:
+# capture_leaderboard.py already refuses, loudly and with a nonzero exit, when
+# the variable is not exactly "1". What it buys is the DIAGNOSIS. Without it,
+# one mistyped character on the export line turns every 07:30 fire into the
+# python's "someone armed it on purpose" message -- which sends the reader
+# looking at the python and at their own environment, when the broken thing is
+# this wrapper's own export. One character should not cost a whole day of
+# captures AND point at the wrong file.
+#
+# Exact match against "1", not "is it non-empty", because that is the python's
+# rule too (LIVE_CAPTURE_ARMED is an == "1" comparison, so "0" and "false" are
+# disarmed). The ${VAR-default} form is needed because `set -u` would otherwise
+# kill the shell on an unset variable with an error that explains nothing --
+# and an unset variable is precisely what a typo on the export line produces.
+# No colon in that form, on purpose: unset and exported-as-empty stay different
+# diagnoses, the same distinction live_capture_env_display() makes in the
+# python. The value is read into armed_value so the message below reports what
+# the check actually TESTED; re-reading the variable inside the message would
+# let the two disagree, and when the typo is on the check line it printed the
+# baffling "is 1, expected 1".
+#
+# THE ONE CASE IT MISSES, stated so nobody thinks it is airtight: a caller who
+# had already exported the correctly-spelled variable before invoking this
+# script would satisfy this check even with a typo'd export line, because the
+# value read here came from them and not from the line above. launchd is not
+# such a caller: the plist's EnvironmentVariables dict sets PATH and nothing
+# else, so the 07:30 fire -- the path that actually matters -- is covered.
+armed_value="${FOMO_LIVE_CAPTURE-<unset>}"
+if [ "$armed_value" != "1" ]; then
+    say "FATAL: the export line in this wrapper did not arm the capture."
+    say "FATAL: FOMO_LIVE_CAPTURE reads as \"$armed_value\", expected \"1\"."
+    say "FATAL: The bug is in run_capture.sh: either the export line or the"
+    say "FATAL: armed_value check below it spells the variable's name wrong,"
+    say "FATAL: and the two no longer agree. Nothing was run -- no browser,"
+    say "FATAL: no capture, no manifest row."
+    say "==== fomo capture: finished exit=$EXIT_NOT_ARMED elapsed=0s ===="
+    exit "$EXIT_NOT_ARMED"
+fi
+say "live capture armed (FOMO_LIVE_CAPTURE=1, verified)"
 
 # caffeinate -i: assert "do not idle-sleep" for as long as the capture runs.
 # The board does not render headless (measured -- see launch_browser()), so

@@ -31,24 +31,27 @@
     produced forty-four "manifest row appended" lines, which is exactly the
     kind of doubling that makes a person mistrust a count.
 
-    So they are split by who writes them:
+    So they are split by who writes them, and under launchd the split is now
+    clean -- no line appears in both:
 
       logs/capture.log  -- the python's own logger, written directly by a
-                           FileHandler. One line per event, no duplication.
-                           This is the run's story: what was captured, what
-                           was skipped, what failed and why.
+                           FileHandler. One line per event. This is the run's
+                           story: which mode the live-capture interlock was
+                           in, what was captured, what was skipped, what
+                           failed and why. START HERE.
       logs/launchd.log  -- everything launchd sees on the job's stdout and
-                           stderr. run_capture.sh's start/finish banners, a
+                           stderr, and ONLY the things capture.log cannot
+                           carry: run_capture.sh's own banner lines, a
                            traceback from an import that died before logging
-                           was configured, Playwright's and Chrome's stderr
-                           chatter -- none of which the logger can reach.
+                           was configured, and Playwright's and Chrome's own
+                           stderr chatter.
 
-    THE HONEST CAVEAT: the python's logger still echoes to stdout as well as
-    to its file, so launchd.log also carries a copy of capture.log's lines. No
-    ONE file is doubled, which was the defect; but launchd.log is a superset,
-    not a tidy stderr-only file, and a reader should go to capture.log first.
-    The echo is kept because it is what a person sees when they run
-    ./run_capture.sh by hand in a terminal.
+    THE ECHO IS CONDITIONAL, which is what makes the split clean. The python
+    adds a stderr handler only when sys.stdout.isatty() -- so a person running
+    ./run_capture.sh by hand still watches it work in the terminal, while
+    under launchd stdout is this file, isatty() is False, and no copy is made.
+    Measured before that change: 226 of 226 lines in launchd.log were
+    byte-identical duplicates of capture.log lines. See setup_logging().
 
     launchd APPENDS to both, so each accumulates fire after fire in order. If
     the python never starts at all, the wrapper's two banner lines in
